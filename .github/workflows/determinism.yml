@@ -210,37 +210,44 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Evidence leg 3 (informational): MSVC on Windows, default build (b3821).
-  # MSVC does not contract FP expressions at its default /fp:precise (VS2022+),
-  # so its default output is expected to already match the strict GNU/Clang
-  # builds. Informational: the verdict reports but never fails on this leg.
+  # Evidence leg 3 (informational): MSVC on Windows, default build, at the SAME
+  # pinned master commit as the master-patch leg. MSVC does not contract FP
+  # expressions at its default /fp:precise (VS2022+), so its default output is
+  # expected to already match the patched GNU/Clang builds — i.e. the patch
+  # brings GNU/Clang in line with what MSVC users already get. Informational:
+  # the verdict reports but never fails on this leg. (b3821 is not buildable
+  # with current MSVC STL, so this leg runs at master only.)
   # ---------------------------------------------------------------------------
   msvc:
     runs-on: windows-latest
     continue-on-error: true
     steps:
-      - name: Clone llama.cpp (pinned)
-        run: git clone --depth 1 --branch "$env:LLAMA_TAG" https://github.com/ggml-org/llama.cpp
+      - name: Clone llama.cpp at pinned master commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir llama.cpp && cd llama.cpp
+          git init -q
+          git remote add origin https://github.com/ggml-org/llama.cpp
+          git fetch -q --depth 1 origin "$LLAMA_MASTER_SHA"
+          git checkout -q FETCH_HEAD
 
       - name: Build llama-quantize (MSVC default)
         shell: bash
         run: |
           set -euo pipefail
           cd llama.cpp
-          cmake -B build
+          cmake -B build -DLLAMA_CURL=OFF
           cmake --build build --config Release --target llama-quantize -j 4
 
-      - name: Download F16 model + imatrix and verify sha256
+      - name: Download F16 model and verify sha256
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p work
           curl -sL --retry 3 --retry-delay 5 -o work/model-f16.gguf \
             "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-f16.gguf"
-          curl -sL --retry 3 --retry-delay 5 -o work/imatrix.dat \
-            "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct.imatrix"
           echo "1f33ad43d2b85b908ff06fe7002b69806a57359b9b2617ca27d7bdea428ae146  work/model-f16.gguf" | sha256sum -c -
-          echo "ede239ca3952a383264004812198e788932e53812a0e72bcb0ef7f3cf001f846  work/imatrix.dat" | sha256sum -c -
 
       - name: Quantize
         shell: bash
@@ -251,16 +258,15 @@ jobs:
           for q in Q4_K_M Q6_K Q8_0 IQ4_XS; do
             "$Q" model-f16.gguf "out-${q}.gguf" "$q"
           done
-          "$Q" --imatrix imatrix.dat model-f16.gguf out-imat-Q4_K_M.gguf Q4_K_M
 
       - name: Emit hashes
         shell: bash
         run: |
           set -euo pipefail
           cd work
-          out="../hashes-win-llama-3.2-1b-msvc-default.txt"
+          out="../hashes-win-master-msvc-default.txt"
           : > "$out"
-          for q in Q4_K_M Q6_K Q8_0 IQ4_XS imat-Q4_K_M; do
+          for q in Q4_K_M Q6_K Q8_0 IQ4_XS; do
             h=$(sha256sum "out-${q}.gguf" | awk '{print $1}')
             s=$(wc -c < "out-${q}.gguf" | tr -d ' ')
             echo "$q $h $s" >> "$out"
@@ -270,7 +276,7 @@ jobs:
       - name: Upload hashes artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hashes-win-llama-3.2-1b-msvc-default
+          name: hashes-win-master-msvc-default
           path: hashes-win-*.txt
           if-no-files-found: error
 
@@ -350,20 +356,13 @@ jobs:
                   print(f"  default ubuntu vs macos {q:<12}: {status} ({expect})")
 
               print("\n==================== CORE CLAIM: strict ubuntu == strict macos ====================")
-              for q in core_quants:
+              for q in core_quants + ext_quants:
                   u = data[("ubuntu-latest", "strict")][q]
                   m = data[("macos-14", "strict")][q]
                   status = "MATCH" if u == m else "DIFFER"
                   print(f"  strict  ubuntu vs macos {q:<12}: {status}")
                   if u != m:
                       failures.append(f"b3821/{model}/strict/{q}")
-
-              print("\n==================== EXTENDED (informational this run): strict cross-arch ====================")
-              for q in ext_quants:
-                  u = data[("ubuntu-latest", "strict")][q]
-                  m = data[("macos-14", "strict")][q]
-                  status = "MATCH" if u == m else "DIFFER  <-- INVESTIGATE"
-                  print(f"  strict  ubuntu vs macos {q:<12}: {status}")
 
           # ---------------- master: unpatched vs the actual PR patch ----------------
           print("\n######################## MASTER (pinned) : llama-3.2-1b ########################")
@@ -401,16 +400,19 @@ jobs:
               print(f"  {k[0]:<14} {k[1]:<8} {t.get('TIME_ST_Q4_K_M', '?')} s")
 
           # ---------------- MSVC (informational) ----------------
-          win = "hashes-win-llama-3.2-1b-msvc-default.txt"
-          print("\n######################## MSVC windows-latest (informational) ########################")
+          win = "hashes-win-master-msvc-default.txt"
+          print("\n######################## MSVC windows-latest @ master (informational) ########################")
+          print("Expectation: MSVC /fp:precise does not contract, so its DEFAULT output should")
+          print("already equal the PATCHED GNU/Clang builds at the same master commit.")
           if os.path.exists(win):
               wdata, _ = load(win)
-              sdata, _ = load("hashes-llama-3.2-1b-ubuntu-latest-strict.txt")
-              for q in core_quants + ext_quants:
+              for q in mq:
                   if q not in wdata:
                       continue
-                  status = "MATCH" if wdata[q] == sdata[q] else "DIFFER"
-                  print(f"  msvc default vs b3821 ubuntu strict {q:<12}: {status} ({wdata[q][0][:16]})")
+                  u = mdata[("ubuntu-latest", "patched")][q]
+                  m = mdata[("macos-14", "patched")][q]
+                  status = "MATCH" if wdata[q] == u == m else "DIFFER"
+                  print(f"  msvc default vs master patched (both arches) {q:<8}: {status} ({wdata[q][0][:16]})")
           else:
               print("  no windows artifact (job failed or skipped) - informational leg, ignored")
 
