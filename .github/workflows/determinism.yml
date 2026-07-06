@@ -2,12 +2,22 @@ name: determinism
 
 on:
   push:
+    paths-ignore:
+      - "README.md"
+      - "LICENSE"
   workflow_dispatch:
 
 env:
   LLAMA_TAG: b3821
+  # llama.cpp master pin: "ggml-cpu: use UE4M3 LUT in ARM NVFP4 dot product (#25331)", base b9885
+  LLAMA_MASTER_SHA: 20a04b22063020cd0f29b7781f5352d7a6abf786
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Evidence leg 1 (b3821, the tag the published quants were built with):
+  # default builds vs strict builds (-ffp-contract=off + defensive no-vectorize,
+  # applied globally), 2 models, 2 OS/arch/compiler combos.
+  # ---------------------------------------------------------------------------
   quantize:
     strategy:
       fail-fast: false
@@ -19,9 +29,13 @@ jobs:
           - model: smollm2-135m
             model_url: https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-f16.gguf
             model_sha256: f535f83ec568d040f88ddc04a199fa6da90923bbb41d4dcaed02caa924d6ef57
+            imatrix_url: https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct.imatrix
+            imatrix_sha256: 1248fc3d0ca9bccec848d20f24e93b03a4c738df1d29016824d909301cdecdd7
           - model: llama-3.2-1b
             model_url: https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-f16.gguf
             model_sha256: 1f33ad43d2b85b908ff06fe7002b69806a57359b9b2617ca27d7bdea428ae146
+            imatrix_url: https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct.imatrix
+            imatrix_sha256: ede239ca3952a383264004812198e788932e53812a0e72bcb0ef7f3cf001f846
     runs-on: ${{ matrix.os }}
     steps:
       - name: Clone llama.cpp (pinned)
@@ -52,23 +66,29 @@ jobs:
           cmake --build build --config Release --target llama-quantize -j 4
           ./build/bin/llama-quantize --help >/dev/null 2>&1 || true
 
-      - name: Download F16 model and verify sha256
+      - name: Download F16 model + imatrix and verify sha256
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p work
           curl -sL --retry 3 --retry-delay 5 -o work/model-f16.gguf "${{ matrix.model_url }}"
+          curl -sL --retry 3 --retry-delay 5 -o work/imatrix.dat "${{ matrix.imatrix_url }}"
           if command -v sha256sum >/dev/null 2>&1; then SHA="sha256sum"; else SHA="shasum -a 256"; fi
           echo "${{ matrix.model_sha256 }}  work/model-f16.gguf" | $SHA -c -
+          echo "${{ matrix.imatrix_sha256 }}  work/imatrix.dat" | $SHA -c -
 
-      - name: Quantize (Q4_K_M, Q6_K, Q8_0, no imatrix)
+      - name: Quantize (Q4_K_M, Q6_K, Q8_0, IQ4_XS without imatrix; Q4_K_M with imatrix)
         shell: bash
         run: |
           set -euo pipefail
           cd work
-          for q in Q4_K_M Q6_K Q8_0; do
+          for q in Q4_K_M Q6_K Q8_0 IQ4_XS; do
             ../llama.cpp/build/bin/llama-quantize model-f16.gguf "out-${q}.gguf" "$q"
           done
+          # The imatrix path is passed relative and identical on every platform so the
+          # quantize.imatrix.file KV embedded in the header is byte-identical too,
+          # keeping whole-file sha256 a valid comparator.
+          ../llama.cpp/build/bin/llama-quantize --imatrix imatrix.dat model-f16.gguf out-imat-Q4_K_M.gguf Q4_K_M
 
       - name: Emit hashes
         shell: bash
@@ -78,7 +98,7 @@ jobs:
           cd work
           out="../hashes-${{ matrix.model }}-${{ matrix.os }}-${{ matrix.mode }}.txt"
           : > "$out"
-          for q in Q4_K_M Q6_K Q8_0; do
+          for q in Q4_K_M Q6_K Q8_0 IQ4_XS imat-Q4_K_M; do
             h=$($SHA "out-${q}.gguf" | awk '{print $1}')
             s=$(wc -c < "out-${q}.gguf" | tr -d ' ')
             echo "$q $h $s" >> "$out"
@@ -92,8 +112,175 @@ jobs:
           path: hashes-*.txt
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
+  # Evidence leg 2 (pinned llama.cpp master): the ACTUAL upstream patch
+  # (per-file -ffp-contract=off on ggml-quants.c only, nothing else) vs an
+  # unpatched default build. Proves the one-flag/one-TU change from
+  # ggml-org/llama.cpp#25353 is itself sufficient for cross-arch bit-identity,
+  # and times its cost single-threaded.
+  # ---------------------------------------------------------------------------
+  master-patch:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+        build: [default, patched]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout evidence repo (for the patch)
+        uses: actions/checkout@v4
+
+      - name: Clone llama.cpp at pinned master commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir llama.cpp && cd llama.cpp
+          git init -q
+          git remote add origin https://github.com/ggml-org/llama.cpp
+          git fetch -q --depth 1 origin "$LLAMA_MASTER_SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: Apply the upstream patch (patched build only)
+        if: matrix.build == 'patched'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd llama.cpp
+          git apply --stat ../patches/0001-variant-a-default-on-ggml-build-ggml-quants.c-with-ffp-contract-off.patch
+          git apply ../patches/0001-variant-a-default-on-ggml-build-ggml-quants.c-with-ffp-contract-off.patch
+
+      - name: Build llama-quantize (default flags otherwise)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd llama.cpp
+          EXTRA=()
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            EXTRA+=("-DGGML_METAL=OFF")
+          fi
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF "${EXTRA[@]}"
+          cmake --build build --config Release --target llama-quantize -j 4
+          if [ "${{ matrix.build }}" = "patched" ]; then
+            grep -r "ffp-contract" build/ggml/src/CMakeFiles/ggml-base.dir/ | head -2 || true
+          fi
+
+      - name: Download F16 model and verify sha256
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          curl -sL --retry 3 --retry-delay 5 -o work/model-f16.gguf \
+            "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-f16.gguf"
+          if command -v sha256sum >/dev/null 2>&1; then SHA="sha256sum"; else SHA="shasum -a 256"; fi
+          echo "1f33ad43d2b85b908ff06fe7002b69806a57359b9b2617ca27d7bdea428ae146  work/model-f16.gguf" | $SHA -c -
+
+      - name: Quantize (Q4_K_M, Q6_K, Q8_0, IQ4_XS) + time single-threaded Q4_K_M
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work
+          for q in Q4_K_M Q6_K Q8_0 IQ4_XS; do
+            ../llama.cpp/build/bin/llama-quantize model-f16.gguf "out-${q}.gguf" "$q"
+          done
+          # cost measurement: single-threaded, CPU-bound, one run (informational)
+          /usr/bin/time -p ../llama.cpp/build/bin/llama-quantize model-f16.gguf out-timing.gguf Q4_K_M 1 2> time.txt || cat time.txt
+          grep real time.txt
+
+      - name: Emit hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v sha256sum >/dev/null 2>&1; then SHA="sha256sum"; else SHA="shasum -a 256"; fi
+          cd work
+          out="../hashes-master-${{ matrix.os }}-${{ matrix.build }}.txt"
+          : > "$out"
+          for q in Q4_K_M Q6_K Q8_0 IQ4_XS; do
+            h=$($SHA "out-${q}.gguf" | awk '{print $1}')
+            s=$(wc -c < "out-${q}.gguf" | tr -d ' ')
+            echo "$q $h $s" >> "$out"
+          done
+          echo "TIME_ST_Q4_K_M $(awk '/^real/{print $2}' time.txt)" >> "$out"
+          cat "$out"
+
+      - name: Upload hashes artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hashes-master-${{ matrix.os }}-${{ matrix.build }}
+          path: hashes-master-*.txt
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Evidence leg 3 (informational): MSVC on Windows, default build (b3821).
+  # MSVC does not contract FP expressions at its default /fp:precise (VS2022+),
+  # so its default output is expected to already match the strict GNU/Clang
+  # builds. Informational: the verdict reports but never fails on this leg.
+  # ---------------------------------------------------------------------------
+  msvc:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - name: Clone llama.cpp (pinned)
+        run: git clone --depth 1 --branch "$env:LLAMA_TAG" https://github.com/ggml-org/llama.cpp
+
+      - name: Build llama-quantize (MSVC default)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd llama.cpp
+          cmake -B build
+          cmake --build build --config Release --target llama-quantize -j 4
+
+      - name: Download F16 model + imatrix and verify sha256
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          curl -sL --retry 3 --retry-delay 5 -o work/model-f16.gguf \
+            "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-f16.gguf"
+          curl -sL --retry 3 --retry-delay 5 -o work/imatrix.dat \
+            "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct.imatrix"
+          echo "1f33ad43d2b85b908ff06fe7002b69806a57359b9b2617ca27d7bdea428ae146  work/model-f16.gguf" | sha256sum -c -
+          echo "ede239ca3952a383264004812198e788932e53812a0e72bcb0ef7f3cf001f846  work/imatrix.dat" | sha256sum -c -
+
+      - name: Quantize
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work
+          Q=../llama.cpp/build/bin/Release/llama-quantize.exe
+          for q in Q4_K_M Q6_K Q8_0 IQ4_XS; do
+            "$Q" model-f16.gguf "out-${q}.gguf" "$q"
+          done
+          "$Q" --imatrix imatrix.dat model-f16.gguf out-imat-Q4_K_M.gguf Q4_K_M
+
+      - name: Emit hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work
+          out="../hashes-win-llama-3.2-1b-msvc-default.txt"
+          : > "$out"
+          for q in Q4_K_M Q6_K Q8_0 IQ4_XS imat-Q4_K_M; do
+            h=$(sha256sum "out-${q}.gguf" | awk '{print $1}')
+            s=$(wc -c < "out-${q}.gguf" | tr -d ' ')
+            echo "$q $h $s" >> "$out"
+          done
+          cat "$out"
+
+      - name: Upload hashes artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hashes-win-llama-3.2-1b-msvc-default
+          path: hashes-win-*.txt
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Verdict: hard assertions + informational contrasts, all models and legs.
+  # ---------------------------------------------------------------------------
   verdict:
-    needs: quantize
+    # msvc is continue-on-error (informational), so it never blocks this job;
+    # a missing windows artifact is handled gracefully in the comparison script.
+    needs: [quantize, master-patch, msvc]
     runs-on: ubuntu-latest
     steps:
       - name: Download all hash artifacts
@@ -102,74 +289,138 @@ jobs:
           pattern: hashes-*
           merge-multiple: true
 
-      - name: 4-way comparison and core-claim assertion (per model)
+      - name: Comparisons and core-claim assertions
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'EOF'
-          import sys
+          import os, sys
 
+          def load(path):
+              d, extra = {}, {}
+              with open(path) as f:
+                  for line in f:
+                      parts = line.split()
+                      if not parts:
+                          continue
+                      if parts[0].startswith("TIME_"):
+                          extra[parts[0]] = parts[1] if len(parts) > 1 else "?"
+                      else:
+                          q, h, s = parts
+                          d[q] = (h, s)
+              return d, extra
+
+          failures = []
+
+          # ---------------- b3821: default vs strict, 2 models ----------------
           models = ["smollm2-135m", "llama-3.2-1b"]
           combos = [("ubuntu-latest", "default"), ("macos-14", "default"),
                     ("ubuntu-latest", "strict"), ("macos-14", "strict")]
-          quants = ["Q4_K_M", "Q6_K", "Q8_0"]
-
-          all_failures = {}
+          core_quants = ["Q4_K_M", "Q6_K", "Q8_0"]
+          ext_quants = ["IQ4_XS", "imat-Q4_K_M"]
 
           for model in models:
-              data = {}   # (os, mode) -> {quant: (sha, size)}
+              data = {}
               for os_, mode in combos:
-                  d = {}
-                  with open(f"hashes-{model}-{os_}-{mode}.txt") as f:
-                      for line in f:
-                          q, h, s = line.split()
-                          d[q] = (h, s)
-                  data[(os_, mode)] = d
+                  data[(os_, mode)], _ = load(f"hashes-{model}-{os_}-{mode}.txt")
 
-              print(f"\n######################## MODEL: {model} ########################")
+              print(f"\n######################## b3821 MODEL: {model} ########################")
+              print("\n==================== 4-WAY HASH TABLE (sha256[:16] / bytes) ====================")
               hdr = ["quant"] + [f"{o.split('-')[0]}-{m}" for o, m in combos]
-              print("\n==================== 4-WAY HASH TABLE (sha256 / bytes) ====================")
-              print("  ".join(f"{h:<24}" for h in hdr))
-              for q in quants:
+              print("  ".join(f"{h:<26}" for h in hdr))
+              for q in core_quants + ext_quants:
                   row = [q]
                   for c in combos:
                       h, s = data[c][q]
                       row.append(f"{h[:16]} {s}")
-                  print("  ".join(f"{v:<24}" for v in row))
+                  print("  ".join(f"{v:<26}" for v in row))
 
               print("\nFull hashes:")
               for c in combos:
-                  for q in quants:
+                  for q in core_quants + ext_quants:
                       h, s = data[c][q]
-                      print(f"  {c[0]:<14} {c[1]:<8} {q:<7} {h} {s}")
+                      print(f"  {c[0]:<14} {c[1]:<8} {q:<12} {h} {s}")
 
               print("\n==================== DEFAULT-MODE CONTRAST (informational) ====================")
-              for q in quants:
+              for q in core_quants + ext_quants:
                   u = data[("ubuntu-latest", "default")][q]
                   m = data[("macos-14", "default")][q]
                   status = "MATCH" if u == m else "DIFFER"
                   expect = "expected MATCH" if q == "Q8_0" else "expected DIFFER"
-                  print(f"  default ubuntu vs macos {q:<7}: {status} ({expect})")
+                  print(f"  default ubuntu vs macos {q:<12}: {status} ({expect})")
 
               print("\n==================== CORE CLAIM: strict ubuntu == strict macos ====================")
-              failures = []
-              for q in quants:
+              for q in core_quants:
                   u = data[("ubuntu-latest", "strict")][q]
                   m = data[("macos-14", "strict")][q]
                   status = "MATCH" if u == m else "DIFFER"
-                  print(f"  strict  ubuntu vs macos {q:<7}: {status}")
+                  print(f"  strict  ubuntu vs macos {q:<12}: {status}")
                   if u != m:
-                      failures.append(q)
-              if failures:
-                  all_failures[model] = failures
-                  print(f"\n  [{model}] strict-mode cross-arch mismatch for: {', '.join(failures)}")
-              else:
-                  print(f"\n  [{model}] strict builds are bit-identical across x86_64/gcc and arm64/clang.")
+                      failures.append(f"b3821/{model}/strict/{q}")
+
+              print("\n==================== EXTENDED (informational this run): strict cross-arch ====================")
+              for q in ext_quants:
+                  u = data[("ubuntu-latest", "strict")][q]
+                  m = data[("macos-14", "strict")][q]
+                  status = "MATCH" if u == m else "DIFFER  <-- INVESTIGATE"
+                  print(f"  strict  ubuntu vs macos {q:<12}: {status}")
+
+          # ---------------- master: unpatched vs the actual PR patch ----------------
+          print("\n######################## MASTER (pinned) : llama-3.2-1b ########################")
+          mdata, mtimes = {}, {}
+          for os_ in ["ubuntu-latest", "macos-14"]:
+              for build in ["default", "patched"]:
+                  mdata[(os_, build)], mtimes[(os_, build)] = load(f"hashes-master-{os_}-{build}.txt")
+
+          mq = ["Q4_K_M", "Q6_K", "Q8_0", "IQ4_XS"]
+          print("\nFull hashes:")
+          for k in mdata:
+              for q in mq:
+                  h, s = mdata[k][q]
+                  print(f"  {k[0]:<14} {k[1]:<8} {q:<8} {h} {s}")
+
+          print("\n==================== MASTER DEFAULT CONTRAST (informational) ====================")
+          for q in mq:
+              u = mdata[("ubuntu-latest", "default")][q]
+              m = mdata[("macos-14", "default")][q]
+              status = "MATCH" if u == m else "DIFFER"
+              expect = "expected MATCH" if q == "Q8_0" else "expected DIFFER"
+              print(f"  master default ubuntu vs macos {q:<8}: {status} ({expect})")
+
+          print("\n==================== CORE CLAIM 2: the PR patch alone, at master, cross-arch ====================")
+          for q in mq:
+              u = mdata[("ubuntu-latest", "patched")][q]
+              m = mdata[("macos-14", "patched")][q]
+              status = "MATCH" if u == m else "DIFFER"
+              print(f"  master patched ubuntu vs macos {q:<8}: {status}")
+              if u != m:
+                  failures.append(f"master/patched/{q}")
+
+          print("\n==================== COST (single-threaded Q4_K_M, informational) ====================")
+          for k, t in mtimes.items():
+              print(f"  {k[0]:<14} {k[1]:<8} {t.get('TIME_ST_Q4_K_M', '?')} s")
+
+          # ---------------- MSVC (informational) ----------------
+          win = "hashes-win-llama-3.2-1b-msvc-default.txt"
+          print("\n######################## MSVC windows-latest (informational) ########################")
+          if os.path.exists(win):
+              wdata, _ = load(win)
+              sdata, _ = load("hashes-llama-3.2-1b-ubuntu-latest-strict.txt")
+              for q in core_quants + ext_quants:
+                  if q not in wdata:
+                      continue
+                  status = "MATCH" if wdata[q] == sdata[q] else "DIFFER"
+                  print(f"  msvc default vs b3821 ubuntu strict {q:<12}: {status} ({wdata[q][0][:16]})")
+          else:
+              print("  no windows artifact (job failed or skipped) - informational leg, ignored")
 
           print("\n######################## OVERALL VERDICT ########################")
-          if all_failures:
-              for model, failures in all_failures.items():
-                  print(f"CORE CLAIM REFUTED for {model}: strict-mode cross-arch mismatch for: {', '.join(failures)}")
+          if failures:
+              for f in failures:
+                  print(f"CORE CLAIM REFUTED: cross-arch mismatch at {f}")
               sys.exit(1)
-          print("CORE CLAIM CONFIRMED for ALL models: strict builds are bit-identical across x86_64/gcc and arm64/clang.")
+          print("CORE CLAIM CONFIRMED:")
+          print("  1) b3821 strict builds are bit-identical across x86_64/gcc and arm64/clang (both models).")
+          print("  2) At pinned master, the #25353 patch alone (per-file -ffp-contract=off on ggml-quants.c,")
+          print("     default flags otherwise) produces bit-identical output across x86_64/gcc and arm64/clang.")
           EOF

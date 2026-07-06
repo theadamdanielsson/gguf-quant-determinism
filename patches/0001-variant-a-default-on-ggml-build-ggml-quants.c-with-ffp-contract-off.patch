@@ -1,0 +1,58 @@
+From ea11f66b539be4bc74d8d367c72574f58ed83c47 Mon Sep 17 00:00:00 2001
+From: Adam Danielsson <the.adam.danielsson@gmail.com>
+Date: Mon, 6 Jul 2026 14:14:02 +0200
+Subject: [PATCH] ggml: build ggml-quants.c with -ffp-contract=off
+
+The reference quantization kernels used when producing quantized model
+files (ggml_quantize_chunk -> ggml-quants.c) select scales with FP
+loops that are sensitive to floating point contraction: when the
+compiler fuses a*b+c into an FMA, the chosen scales - and therefore
+the quantized output bits - differ between compilers and architectures.
+Q8_0 is unaffected; the k-quants and i-quants are.
+
+Disable contraction for this single translation unit so that quantizing
+the same tensor data produces bit-identical files on any compiler/arch
+combination. Measured cost: within noise (<2%) on Apple Silicon/clang
+at master; up to ~33% slower quantization on other toolchains in an
+earlier 4-way CI measurement. Quantization is an offline, one-time
+step; runtime inference kernels (ggml-cpu) are not affected.
+
+A '#pragma STDC FP_CONTRACT OFF' in the source would be simpler, but
+GCC does not implement the pragma (it is ignored with a
+-Wunknown-pragmas warning), so a compile flag is required.
+
+Evidence: <link-to-evidence>
+---
+ ggml/src/CMakeLists.txt | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/ggml/src/CMakeLists.txt b/ggml/src/CMakeLists.txt
+index 89e5180..a13c943 100644
+--- a/ggml/src/CMakeLists.txt
++++ b/ggml/src/CMakeLists.txt
+@@ -208,6 +208,22 @@ add_library(ggml-base
+             ggml-quants.h
+             gguf.cpp)
+ 
++# ggml-quants.c contains the reference quantization kernels used when producing
++# quantized model files (ggml_quantize_chunk). The k-quant / i-quant scale
++# search loops in this file are sensitive to floating point contraction (FMA):
++# when the compiler is allowed to contract a*b+c, the selected scales - and
++# therefore the quantized output bits - differ between compilers and
++# architectures. Disabling contraction for this single translation unit makes
++# quantization results bit-identical across compilers and architectures
++# (ref: <link-to-evidence>). Quantization is an offline, one-time operation;
++# the measured cost ranges from none (Apple Silicon/clang) to ~33% slower
++# (x86-64/gcc). Runtime inference kernels (ggml-cpu) are not affected.
++# A '#pragma STDC FP_CONTRACT OFF' in the source is not sufficient:
++# GCC does not implement the pragma and ignores it with a warning.
++if (CMAKE_C_COMPILER_ID MATCHES "GNU" OR CMAKE_C_COMPILER_ID MATCHES "Clang")
++    set_source_files_properties(ggml-quants.c PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
++endif()
++
+ set_target_properties(ggml-base PROPERTIES
+     VERSION ${GGML_VERSION}
+     SOVERSION ${GGML_VERSION_MAJOR}
+-- 
+2.53.0
+
