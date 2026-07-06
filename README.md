@@ -25,6 +25,7 @@ SmolLM2-135M is the fast smoke model; its embedding dim of 576 means most of its
 - **b3821 strict builds:** all five quants **bit-identical** cross-arch, on both models. Asserted by the `verdict` job.
 - **Master, unpatched default:** Q4_K_M, Q6_K, IQ4_XS **differ** cross-arch; Q8_0 matches — the divergence is alive at master, not a b3821 artifact.
 - **Master + the #25353 patch alone:** all four quants **bit-identical** across x86_64/gcc and arm64/clang. Asserted by the `verdict` job. This is the patch as proposed, not a stricter proxy for it.
+- **MSVC (informational):** a default MSVC build at the same master commit produces **exactly the patched GNU/Clang hashes** on all four quants. MSVC does not contract at its default `/fp:precise`, so this independently confirms the mechanism — the patch makes GNU/Clang builds produce the bytes MSVC users already get. Net: gcc/Linux/x86_64, clang/macOS/arm64, and MSVC/Windows/x86_64 all emit one hash set per quant.
 - **Cost:** single-threaded Q4_K_M quantization of the 1B at master measured 92.5 s default vs 80.5 s patched on ubuntu-latest, and 56.7 s vs 53.3 s on macos-14 — no slowdown observed; treat the differences as run-to-run noise. (An earlier ~33% figure measured at b3821 does not reproduce at master.)
 
 Read the `verdict` job of any run for the full hash tables. CORE CLAIM CONFIRMED means: strict-mode b3821 hashes match cross-arch for all five quants on both models, and the patched master build matches cross-arch for all four quants.
