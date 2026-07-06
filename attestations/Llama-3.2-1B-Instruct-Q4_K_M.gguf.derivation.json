@@ -1,0 +1,44 @@
+{
+ "_type": "https://in-toto.io/Statement/v1",
+ "subject": [
+  {
+   "name": "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+   "digest": {
+    "sha256": "26bac8efd811cb41a80db4393dbe5c8360abd54b98954ec766aa4ba7dacc0bc5"
+   }
+  }
+ ],
+ "predicateType": "https://github.com/theadamdanielsson/ggufpacker/attestation/gguf-derivation/v0",
+ "predicate": {
+  "baseModel": {
+   "name": "Llama-3.2-1B-Instruct-f16.gguf",
+   "digest": {
+    "sha256": "1f33ad43d2b85b908ff06fe7002b69806a57359b9b2617ca27d7bdea428ae146"
+   },
+   "sizeBytes": 2479595360
+  },
+  "recipe": {
+   "quantType": "Q4_K_M",
+   "outputFormat": "gguf",
+   "useImatrix": false,
+   "command": "llama-quantize <baseModel> <output> Q4_K_M"
+  },
+  "builder": {
+   "tool": "ggml-org/llama.cpp/llama-quantize",
+   "buildIdentity": {
+    "binarySha256": "dc1d189076fca1a090dd3354298c46a938d0ce8c4c0044a822da53cb83be68ce",
+    "versionBanner": "",
+    "gitRef": "20a04b22063020cd0f29b7781f5352d7a6abf786"
+   }
+  },
+  "reproducibility": {
+   "deterministic": true,
+   "determinismEvidence": "https://github.com/ggml-org/llama.cpp/pull/25353",
+   "reDerivedDigest": {
+    "sha256": "26bac8efd811cb41a80db4393dbe5c8360abd54b98954ec766aa4ba7dacc0bc5"
+   }
+  },
+  "attestedBy": "ggufpacker 0.4.0",
+  "producedAt": "2026-07-06T22:32:16Z"
+ }
+}

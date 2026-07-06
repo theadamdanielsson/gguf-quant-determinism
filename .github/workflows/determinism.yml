@@ -281,6 +281,87 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
+  # Evidence leg 4: cross-machine attestation verification. The statement in
+  # attestations/ was produced by `ggufpacker attest` on macOS/arm64/AppleClang
+  # with a deterministic (patched) build; this job — a different machine,
+  # architecture, and compiler — installs ggufpacker from PyPI, downloads only
+  # the base model, re-derives the quant from the statement's recipe, and
+  # byte-compares against the attested sha256. The quant file itself is never
+  # transferred. A tampered copy of the statement must be refused (exit 2).
+  # ---------------------------------------------------------------------------
+  attestation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout evidence repo (patch + attestation)
+        uses: actions/checkout@v4
+
+      - name: Clone llama.cpp at pinned master commit and apply the patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir llama.cpp && cd llama.cpp
+          git init -q
+          git remote add origin https://github.com/ggml-org/llama.cpp
+          git fetch -q --depth 1 origin "$LLAMA_MASTER_SHA"
+          git checkout -q FETCH_HEAD
+          git apply ../patches/0001-variant-a-default-on-ggml-build-ggml-quants.c-with-ffp-contract-off.patch
+
+      - name: Build llama-quantize (deterministic)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd llama.cpp
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
+          cmake --build build --config Release --target llama-quantize -j 4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ggufpacker from PyPI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet ggufpacker
+          ggufpacker --version
+
+      - name: Download the attested base model (sha256-pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          curl -sL --retry 3 --retry-delay 5 -o work/Llama-3.2-1B-Instruct-f16.gguf \
+            "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-f16.gguf"
+          echo "1f33ad43d2b85b908ff06fe7002b69806a57359b9b2617ca27d7bdea428ae146  work/Llama-3.2-1B-Instruct-f16.gguf" | sha256sum -c -
+
+      - name: Verify the attestation (must reproduce bit-exact)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ggufpacker verify-attestation \
+            attestations/Llama-3.2-1B-Instruct-Q4_K_M.gguf.derivation.json \
+            --dir work \
+            --llama-quantize llama.cpp/build/bin/llama-quantize
+
+      - name: Negative control - a tampered statement must be refused
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          import json
+          d = json.load(open("attestations/Llama-3.2-1B-Instruct-Q4_K_M.gguf.derivation.json"))
+          d["subject"][0]["digest"]["sha256"] = "0" * 64
+          json.dump(d, open("work/tampered.derivation.json", "w"))
+          EOF
+          if ggufpacker verify-attestation work/tampered.derivation.json \
+              --dir work --llama-quantize llama.cpp/build/bin/llama-quantize; then
+            echo "ERROR: tampered statement was accepted"
+            exit 1
+          fi
+          echo "tampered statement refused, as required"
+
+  # ---------------------------------------------------------------------------
   # Verdict: hard assertions + informational contrasts, all models and legs.
   # ---------------------------------------------------------------------------
   verdict:
