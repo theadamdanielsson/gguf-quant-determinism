@@ -6,8 +6,6 @@ on:
 
 env:
   LLAMA_TAG: b3821
-  MODEL_URL: https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-f16.gguf
-  MODEL_SHA256: f535f83ec568d040f88ddc04a199fa6da90923bbb41d4dcaed02caa924d6ef57
 
 jobs:
   quantize:
@@ -16,6 +14,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-14]
         mode: [default, strict]
+        model: [smollm2-135m, llama-3.2-1b]
+        include:
+          - model: smollm2-135m
+            model_url: https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-f16.gguf
+            model_sha256: f535f83ec568d040f88ddc04a199fa6da90923bbb41d4dcaed02caa924d6ef57
+          - model: llama-3.2-1b
+            model_url: https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-f16.gguf
+            model_sha256: 1f33ad43d2b85b908ff06fe7002b69806a57359b9b2617ca27d7bdea428ae146
     runs-on: ${{ matrix.os }}
     steps:
       - name: Clone llama.cpp (pinned)
@@ -51,9 +57,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work
-          curl -sL --retry 3 --retry-delay 5 -o work/model-f16.gguf "$MODEL_URL"
+          curl -sL --retry 3 --retry-delay 5 -o work/model-f16.gguf "${{ matrix.model_url }}"
           if command -v sha256sum >/dev/null 2>&1; then SHA="sha256sum"; else SHA="shasum -a 256"; fi
-          echo "$MODEL_SHA256  work/model-f16.gguf" | $SHA -c -
+          echo "${{ matrix.model_sha256 }}  work/model-f16.gguf" | $SHA -c -
 
       - name: Quantize (Q4_K_M, Q6_K, Q8_0, no imatrix)
         shell: bash
@@ -70,7 +76,7 @@ jobs:
           set -euo pipefail
           if command -v sha256sum >/dev/null 2>&1; then SHA="sha256sum"; else SHA="shasum -a 256"; fi
           cd work
-          out="../hashes-${{ matrix.os }}-${{ matrix.mode }}.txt"
+          out="../hashes-${{ matrix.model }}-${{ matrix.os }}-${{ matrix.mode }}.txt"
           : > "$out"
           for q in Q4_K_M Q6_K Q8_0; do
             h=$($SHA "out-${q}.gguf" | awk '{print $1}')
@@ -82,7 +88,7 @@ jobs:
       - name: Upload hashes artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hashes-${{ matrix.os }}-${{ matrix.mode }}
+          name: hashes-${{ matrix.model }}-${{ matrix.os }}-${{ matrix.mode }}
           path: hashes-*.txt
           if-no-files-found: error
 
@@ -96,62 +102,74 @@ jobs:
           pattern: hashes-*
           merge-multiple: true
 
-      - name: 4-way comparison and core-claim assertion
+      - name: 4-way comparison and core-claim assertion (per model)
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'EOF'
           import sys
 
+          models = ["smollm2-135m", "llama-3.2-1b"]
           combos = [("ubuntu-latest", "default"), ("macos-14", "default"),
                     ("ubuntu-latest", "strict"), ("macos-14", "strict")]
           quants = ["Q4_K_M", "Q6_K", "Q8_0"]
 
-          data = {}   # (os, mode) -> {quant: (sha, size)}
-          for os_, mode in combos:
-              d = {}
-              with open(f"hashes-{os_}-{mode}.txt") as f:
-                  for line in f:
-                      q, h, s = line.split()
-                      d[q] = (h, s)
-              data[(os_, mode)] = d
+          all_failures = {}
 
-          hdr = ["quant"] + [f"{o.split('-')[0]}-{m}" for o, m in combos]
-          print("\n==================== 4-WAY HASH TABLE (sha256 / bytes) ====================")
-          print("  ".join(f"{h:<24}" for h in hdr))
-          for q in quants:
-              row = [q]
-              for c in combos:
-                  h, s = data[c][q]
-                  row.append(f"{h[:16]} {s}")
-              print("  ".join(f"{v:<24}" for v in row))
+          for model in models:
+              data = {}   # (os, mode) -> {quant: (sha, size)}
+              for os_, mode in combos:
+                  d = {}
+                  with open(f"hashes-{model}-{os_}-{mode}.txt") as f:
+                      for line in f:
+                          q, h, s = line.split()
+                          d[q] = (h, s)
+                  data[(os_, mode)] = d
 
-          print("\nFull hashes:")
-          for c in combos:
+              print(f"\n######################## MODEL: {model} ########################")
+              hdr = ["quant"] + [f"{o.split('-')[0]}-{m}" for o, m in combos]
+              print("\n==================== 4-WAY HASH TABLE (sha256 / bytes) ====================")
+              print("  ".join(f"{h:<24}" for h in hdr))
               for q in quants:
-                  h, s = data[c][q]
-                  print(f"  {c[0]:<14} {c[1]:<8} {q:<7} {h} {s}")
+                  row = [q]
+                  for c in combos:
+                      h, s = data[c][q]
+                      row.append(f"{h[:16]} {s}")
+                  print("  ".join(f"{v:<24}" for v in row))
 
-          print("\n==================== DEFAULT-MODE CONTRAST (informational) ====================")
-          for q in quants:
-              u = data[("ubuntu-latest", "default")][q]
-              m = data[("macos-14", "default")][q]
-              status = "MATCH" if u == m else "DIFFER"
-              expect = "expected MATCH" if q == "Q8_0" else "expected DIFFER"
-              print(f"  default ubuntu vs macos {q:<7}: {status} ({expect})")
+              print("\nFull hashes:")
+              for c in combos:
+                  for q in quants:
+                      h, s = data[c][q]
+                      print(f"  {c[0]:<14} {c[1]:<8} {q:<7} {h} {s}")
 
-          print("\n==================== CORE CLAIM: strict ubuntu == strict macos ====================")
-          failures = []
-          for q in quants:
-              u = data[("ubuntu-latest", "strict")][q]
-              m = data[("macos-14", "strict")][q]
-              status = "MATCH" if u == m else "DIFFER"
-              print(f"  strict  ubuntu vs macos {q:<7}: {status}")
-              if u != m:
-                  failures.append(q)
+              print("\n==================== DEFAULT-MODE CONTRAST (informational) ====================")
+              for q in quants:
+                  u = data[("ubuntu-latest", "default")][q]
+                  m = data[("macos-14", "default")][q]
+                  status = "MATCH" if u == m else "DIFFER"
+                  expect = "expected MATCH" if q == "Q8_0" else "expected DIFFER"
+                  print(f"  default ubuntu vs macos {q:<7}: {status} ({expect})")
 
-          if failures:
-              print(f"\nCORE CLAIM REFUTED: strict-mode cross-arch mismatch for: {', '.join(failures)}")
+              print("\n==================== CORE CLAIM: strict ubuntu == strict macos ====================")
+              failures = []
+              for q in quants:
+                  u = data[("ubuntu-latest", "strict")][q]
+                  m = data[("macos-14", "strict")][q]
+                  status = "MATCH" if u == m else "DIFFER"
+                  print(f"  strict  ubuntu vs macos {q:<7}: {status}")
+                  if u != m:
+                      failures.append(q)
+              if failures:
+                  all_failures[model] = failures
+                  print(f"\n  [{model}] strict-mode cross-arch mismatch for: {', '.join(failures)}")
+              else:
+                  print(f"\n  [{model}] strict builds are bit-identical across x86_64/gcc and arm64/clang.")
+
+          print("\n######################## OVERALL VERDICT ########################")
+          if all_failures:
+              for model, failures in all_failures.items():
+                  print(f"CORE CLAIM REFUTED for {model}: strict-mode cross-arch mismatch for: {', '.join(failures)}")
               sys.exit(1)
-          print("\nCORE CLAIM CONFIRMED: strict builds are bit-identical across x86_64/gcc and arm64/clang.")
+          print("CORE CLAIM CONFIRMED for ALL models: strict builds are bit-identical across x86_64/gcc and arm64/clang.")
           EOF
