@@ -1,0 +1,264 @@
+name: chain
+
+# The full derivation chain, attested and verified across machines.
+#
+# Job `attest` (ubuntu/x86_64/gcc) starts from public sources only: the
+# SmolLM2-135M-Instruct safetensors snapshot at a pinned revision and
+# llama.cpp at the pinned master commit (converter as-is, quantize with the
+# deterministic patch). It converts, quantizes, and produces two linked
+# attestations with ggufpacker: F16 <- snapshot (gguf-conversion/v0) and
+# Q4_K_M <- F16 (gguf-derivation/v0).
+#
+# Job `verify` (macos-14/arm64/AppleClang) receives ONLY the two JSON
+# statements — the F16 and the quant never leave the first machine. From the
+# same public sources it re-derives both edges with `ggufpacker verify-chain`
+# and byte-compares against the attested digests, with --check-source
+# anchoring the snapshot to its published Hugging Face revision. A pass means:
+# a different OS, architecture and compiler reproduced the exact quant bytes
+# from huggingface.co and llama.cpp sources plus 4 KB of JSON.
+
+on:
+  push:
+    paths:
+      - ".github/workflows/chain.yml"
+  workflow_dispatch:
+
+env:
+  # Same llama.cpp master pin as the quantization and conversion legs
+  LLAMA_MASTER_SHA: 20a04b22063020cd0f29b7781f5352d7a6abf786
+  # ggufpacker 0.5.0 (first release with attest-conversion / verify-chain),
+  # pinned by source commit
+  GGUFPACKER_REF: 8b13bcfedcbdb1548bfcb8c8021c2c5e0ec02d94
+  MODEL_REPO: HuggingFaceTB/SmolLM2-135M-Instruct
+  MODEL_REVISION: 12fd25f77366fa6b3b4b768ec3050bf629380bac
+  MODEL_DIR: SmolLM2-135M-Instruct
+  MODEL_DIGESTS: conversion/smollm2-135m-instruct-input-digests.txt
+  # F16 sha256 already proven machine-independent by the conversion workflow
+  F16_SHA256: ec30a679158ea1e49301f2e76c9f7ab03bcf311367cf418bf2753b4eed0d9c24
+
+jobs:
+  attest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout evidence repo (patch + input digests)
+        uses: actions/checkout@v4
+
+      - name: Clone llama.cpp at pinned master commit and apply the patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir llama.cpp && cd llama.cpp
+          git init -q
+          git remote add origin https://github.com/ggml-org/llama.cpp
+          git fetch -q --depth 1 origin "$LLAMA_MASTER_SHA"
+          git checkout -q FETCH_HEAD
+          git apply ../patches/0001-variant-a-default-on-ggml-build-ggml-quants.c-with-ffp-contract-off.patch
+
+      - name: Build llama-quantize (deterministic)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd llama.cpp
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
+          cmake --build build --config Release --target llama-quantize -j 4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install converter dependencies and ggufpacker
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet -r llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+          python3 -m pip install --quiet "git+https://github.com/theadamdanielsson/ggufpacker@${GGUFPACKER_REF}"
+          ggufpacker --version
+
+      - name: Download the safetensors snapshot at the pinned revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          python3 - <<EOF
+          from huggingface_hub import snapshot_download
+          snapshot_download("${MODEL_REPO}",
+              revision="${MODEL_REVISION}",
+              local_dir="work/${MODEL_DIR}",
+              allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja", "*.model"])
+          EOF
+          rm -rf "work/${MODEL_DIR}/.cache"
+
+      - name: Verify the input closure (exact file set + sha256 of every file)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "work/${MODEL_DIR}"
+          find . -type f | sed 's|^\./||' | sort > /tmp/actual-files.txt
+          awk '{print $2}' "$GITHUB_WORKSPACE/${MODEL_DIGESTS}" | sort > /tmp/expected-files.txt
+          diff -u /tmp/expected-files.txt /tmp/actual-files.txt
+          sha256sum -c "$GITHUB_WORKSPACE/${MODEL_DIGESTS}"
+
+      - name: Convert to F16 (must equal the proven machine-independent hash)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 llama.cpp/convert_hf_to_gguf.py --outtype f16 \
+            --outfile "work/${MODEL_DIR}-f16.gguf" "work/${MODEL_DIR}"
+          echo "${F16_SHA256}  work/${MODEL_DIR}-f16.gguf" | sha256sum -c -
+
+      - name: Attest the conversion edge (F16 <- snapshot)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ggufpacker attest-conversion "work/${MODEL_DIR}-f16.gguf" \
+            --source-dir "work/${MODEL_DIR}" \
+            --llama-cpp-dir llama.cpp \
+            --source-uri "pkg:huggingface/${MODEL_REPO}" \
+            --source-revision "${MODEL_REVISION}"
+
+      - name: Quantize and attest the quant edge (Q4_K_M <- F16)
+        shell: bash
+        run: |
+          set -euo pipefail
+          llama.cpp/build/bin/llama-quantize \
+            "work/${MODEL_DIR}-f16.gguf" "work/${MODEL_DIR}-Q4_K_M.gguf" Q4_K_M
+          ggufpacker attest "work/${MODEL_DIR}-Q4_K_M.gguf" \
+            --source "work/${MODEL_DIR}-f16.gguf" \
+            --qtype Q4_K_M \
+            --llama-quantize llama.cpp/build/bin/llama-quantize \
+            --llama-cpp-ref "$LLAMA_MASTER_SHA" \
+            --deterministic-build
+
+      - name: Upload ONLY the two statements (models never leave this machine)
+        uses: actions/upload-artifact@v4
+        with:
+          name: chain-statements
+          path: |
+            work/*.conversion.json
+            work/*.derivation.json
+          if-no-files-found: error
+
+  verify:
+    needs: attest
+    runs-on: macos-14
+    steps:
+      - name: Checkout evidence repo (patch + input digests)
+        uses: actions/checkout@v4
+
+      - name: Download the two statements — all this machine gets from the attester
+        uses: actions/download-artifact@v4
+        with:
+          name: chain-statements
+          path: work
+
+      - name: Clone llama.cpp at pinned master commit and apply the patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir llama.cpp && cd llama.cpp
+          git init -q
+          git remote add origin https://github.com/ggml-org/llama.cpp
+          git fetch -q --depth 1 origin "$LLAMA_MASTER_SHA"
+          git checkout -q FETCH_HEAD
+          git apply ../patches/0001-variant-a-default-on-ggml-build-ggml-quants.c-with-ffp-contract-off.patch
+
+      - name: Build llama-quantize (deterministic)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd llama.cpp
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
+          cmake --build build --config Release --target llama-quantize -j 4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install converter dependencies and ggufpacker
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet -r llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+          python3 -m pip install --quiet "git+https://github.com/theadamdanielsson/ggufpacker@${GGUFPACKER_REF}"
+          ggufpacker --version
+
+      - name: Download the safetensors snapshot at the pinned revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<EOF
+          from huggingface_hub import snapshot_download
+          snapshot_download("${MODEL_REPO}",
+              revision="${MODEL_REVISION}",
+              local_dir="work/${MODEL_DIR}",
+              allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja", "*.model"])
+          EOF
+          rm -rf "work/${MODEL_DIR}/.cache"
+
+      - name: Verify the input closure (exact file set + sha256 of every file)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "work/${MODEL_DIR}"
+          find . -type f | sed 's|^\./||' | sort > /tmp/actual-files.txt
+          awk '{print $2}' "$GITHUB_WORKSPACE/${MODEL_DIGESTS}" | sort > /tmp/expected-files.txt
+          diff -u /tmp/expected-files.txt /tmp/actual-files.txt
+          shasum -a 256 -c "$GITHUB_WORKSPACE/${MODEL_DIGESTS}"
+
+      - name: Materialize the F16 from public sources (the quant edge needs it on disk)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 llama.cpp/convert_hf_to_gguf.py --outtype f16 \
+            --outfile "work/${MODEL_DIR}-f16.gguf" "work/${MODEL_DIR}"
+
+      - name: Verify the chain (both edges re-derived, root anchored to HF)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ggufpacker verify-chain \
+            "work/${MODEL_DIR}-Q4_K_M.gguf.derivation.json" \
+            "work/${MODEL_DIR}-f16.gguf.conversion.json" \
+            --dir work \
+            --llama-quantize llama.cpp/build/bin/llama-quantize \
+            --llama-cpp-dir llama.cpp \
+            --check-source
+
+      - name: Negative control - a broken link must be refused
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          import json, os
+          d = json.load(open(f"work/{os.environ['MODEL_DIR']}-f16.gguf.conversion.json"))
+          d["subject"][0]["digest"]["sha256"] = "0" * 64
+          d["predicate"]["reproducibility"]["reDerivedDigest"]["sha256"] = "0" * 64
+          json.dump(d, open("work/unlinked.conversion.json", "w"))
+          EOF
+          if ggufpacker verify-chain \
+              "work/${MODEL_DIR}-Q4_K_M.gguf.derivation.json" \
+              work/unlinked.conversion.json \
+              --dir work \
+              --llama-quantize llama.cpp/build/bin/llama-quantize \
+              --llama-cpp-dir llama.cpp; then
+            echo "ERROR: broken chain was accepted"
+            exit 1
+          fi
+          echo "broken chain refused, as required"
+
+  verdict:
+    needs: [attest, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - name: State the proven claim
+        shell: bash
+        run: |
+          echo "Chain proven across machines: ubuntu/x86_64/gcc attested"
+          echo "snapshot -> F16 -> Q4_K_M from public sources; macos-14/arm64/"
+          echo "AppleClang received only the two JSON statements, re-derived"
+          echo "both edges from huggingface.co and llama.cpp at the same pins,"
+          echo "and byte-compared everything — with the snapshot itself anchored"
+          echo "to its published revision. The model files never crossed"
+          echo "machines. A statement with a broken link is refused."

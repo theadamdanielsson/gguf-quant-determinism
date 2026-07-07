@@ -2,6 +2,7 @@
 
 [![determinism](https://github.com/theadamdanielsson/gguf-quant-determinism/actions/workflows/determinism.yml/badge.svg)](https://github.com/theadamdanielsson/gguf-quant-determinism/actions/workflows/determinism.yml)
 [![conversion](https://github.com/theadamdanielsson/gguf-quant-determinism/actions/workflows/conversion.yml/badge.svg)](https://github.com/theadamdanielsson/gguf-quant-determinism/actions/workflows/conversion.yml)
+[![chain](https://github.com/theadamdanielsson/gguf-quant-determinism/actions/workflows/chain.yml/badge.svg)](https://github.com/theadamdanielsson/gguf-quant-determinism/actions/workflows/chain.yml)
 
 Re-runnable CI evidence for three claims about how GGUF files get made:
 
@@ -71,15 +72,23 @@ Probed locally beyond the CI matrix, all bit-identical: repeated runs, PYTHONHAS
 
 Why this is expected: BF16 → F16 is exact for every in-range value (a 7-bit mantissa fits in a 10-bit one), and the converter does no reductions and no threading, so the numeric surface where machines could disagree is nearly empty. It still had to be measured. Measured scope: dense and MoE text models, single- and multi-shard, F16 output. Not measured: mmproj/vision paths, converter-side quantized outtypes (q8_0 etc.), big-endian.
 
+## The chain leg (attest on one machine, verify on another)
+
+[chain.yml](.github/workflows/chain.yml) is what the two determinism results unlock, run end to end. An ubuntu/x86_64/gcc machine starts from public sources only — the SmolLM2-135M-Instruct snapshot at a pinned revision, llama.cpp at the pinned master (quantize built with the #25353 patch) — converts, quantizes, and writes two linked proofs with [ggufpacker](https://github.com/theadamdanielsson/ggufpacker): F16 from snapshot, Q4_K_M from F16.
+
+A macos-14/arm64/AppleClang machine then receives **only the two JSON statements** — about 4 KB. The F16 and the quant never leave the first machine. From the same public sources it re-derives both steps with `ggufpacker verify-chain` and byte-compares against the attested digests, with the snapshot itself checked against what Hugging Face publishes at the recorded revision. A conversion statement with a broken link to the quant statement must be refused.
+
+A green run means: a different OS, architecture and compiler reproduced the exact quant bytes from huggingface.co and llama.cpp sources plus two small proof files — the whole path from the published safetensors to the deployed quant, checked rather than trusted.
+
 ## How to re-run
 
 Everything is public and pinned; no secrets, no local state:
 
 1. Fork this repo.
-2. Actions tab → `determinism` or `conversion` → Run workflow (or push any commit touching the workflow).
+2. Actions tab → `determinism`, `conversion` or `chain` → Run workflow (or push any commit touching the workflow).
 3. Read the `verdict` job output.
 
-The workflows are [.github/workflows/determinism.yml](.github/workflows/determinism.yml) and [.github/workflows/conversion.yml](.github/workflows/conversion.yml); the upstream patch under test is in [patches/](patches/).
+The workflows are [.github/workflows/determinism.yml](.github/workflows/determinism.yml), [.github/workflows/conversion.yml](.github/workflows/conversion.yml) and [.github/workflows/chain.yml](.github/workflows/chain.yml); the upstream patch under test is in [patches/](patches/).
 
 ## License
 
