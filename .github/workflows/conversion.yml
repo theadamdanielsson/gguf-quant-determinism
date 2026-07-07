@@ -1,0 +1,247 @@
+name: conversion
+
+# Does convert_hf_to_gguf.py produce bit-identical F16 GGUFs across machines?
+#
+# Each leg: clone llama.cpp at the same pinned master commit as the
+# quantization legs, install the converter's own pinned requirements, download
+# the safetensors snapshot at a pinned revision, verify the sha256 of every
+# input file, convert, and hard-assert the output sha256 equals the hash
+# produced on an independent arm64/macOS machine outside CI.
+#
+# The snapshot is materialized in a directory named after the source repo's
+# basename. This matters: general.name, general.basename, general.finetune and
+# general.size_label are derived by heuristics on the directory name, so a
+# differently-named directory changes the KV header (tensor payloads are
+# unaffected). Same class of pitfall as the imatrix path embedded by
+# llama-quantize: derivation is only whole-file-reproducible if the naming
+# convention is part of the recipe.
+
+on:
+  push:
+    paths:
+      - ".github/workflows/conversion.yml"
+      - "conversion/**"
+  workflow_dispatch:
+
+env:
+  # Same llama.cpp master pin as the quantization and attestation legs
+  LLAMA_MASTER_SHA: 20a04b22063020cd0f29b7781f5352d7a6abf786
+
+jobs:
+  convert:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+        model: [smollm2-135m-instruct, qwen2.5-0.5b-instruct, granite-3.0-1b-a400m-instruct, mixtral-tiny]
+        include:
+          - model: smollm2-135m-instruct
+            repo: HuggingFaceTB/SmolLM2-135M-Instruct
+            revision: 12fd25f77366fa6b3b4b768ec3050bf629380bac
+            dir: SmolLM2-135M-Instruct
+            digests: conversion/smollm2-135m-instruct-input-digests.txt
+            # F16 sha256 produced on an independent arm64/macOS machine
+            expected_sha256: ec30a679158ea1e49301f2e76c9f7ab03bcf311367cf418bf2753b4eed0d9c24
+          - model: qwen2.5-0.5b-instruct
+            repo: Qwen/Qwen2.5-0.5B-Instruct
+            revision: 7ae557604adf67be50417f59c2c2f167def9a775
+            dir: Qwen2.5-0.5B-Instruct
+            digests: conversion/qwen2.5-0.5b-instruct-input-digests.txt
+            expected_sha256: 977753a3fb91f43c146b3437b90e09a99ffaef95e0b62ce02869ddc792d3c421
+          # MoE (GraniteMoe path; checkpoint stores experts pre-stacked)
+          - model: granite-3.0-1b-a400m-instruct
+            repo: ibm-granite/granite-3.0-1b-a400m-instruct
+            revision: ffec3c35bdfd97a06f0b4cd5fcc92cd9b1584445
+            dir: granite-3.0-1b-a400m-instruct
+            digests: conversion/granite-3.0-1b-a400m-instruct-input-digests.txt
+            expected_sha256: 9a8b6fcdee0e3b5cbd93e0813faabc93755173643070ad5794fa41c8c970c6d0
+          # MoE with per-expert checkpoint tensors (exercises the expert-stacking path)
+          - model: mixtral-tiny
+            repo: dacorvo/Mixtral-tiny
+            revision: c557ba205ddff6ea911f4719e0d543d6c08356b6
+            dir: Mixtral-tiny
+            digests: conversion/mixtral-tiny-input-digests.txt
+            expected_sha256: 45ac8d74620ae0d609884284d757f36594570af6586c945f9ea94c9c04af91e8
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout evidence repo (input digests)
+        uses: actions/checkout@v4
+
+      - name: Clone llama.cpp at pinned master commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir llama.cpp && cd llama.cpp
+          git init -q
+          git remote add origin https://github.com/ggml-org/llama.cpp
+          git fetch -q --depth 1 origin "$LLAMA_MASTER_SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install converter dependencies (llama.cpp's own pins)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet -r llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+          python3 -m pip freeze | grep -E "^(numpy|torch|transformers|safetensors|sentencepiece|gguf|protobuf)=" || true
+
+      - name: Download the safetensors snapshot at the pinned revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          from huggingface_hub import snapshot_download
+          snapshot_download("${{ matrix.repo }}",
+              revision="${{ matrix.revision }}",
+              local_dir="models/${{ matrix.dir }}",
+              allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja", "*.model"])
+          EOF
+
+      - name: Verify the input closure (exact file set + sha256 of every file)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "models/${{ matrix.dir }}"
+          rm -rf .cache
+          find . -type f | sed 's|^\./||' | sort > /tmp/actual-files.txt
+          awk '{print $2}' "$GITHUB_WORKSPACE/${{ matrix.digests }}" | sort > /tmp/expected-files.txt
+          diff -u /tmp/expected-files.txt /tmp/actual-files.txt
+          if command -v sha256sum >/dev/null 2>&1; then SHA="sha256sum"; else SHA="shasum -a 256"; fi
+          $SHA -c "$GITHUB_WORKSPACE/${{ matrix.digests }}"
+
+      - name: Convert to F16 GGUF
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 llama.cpp/convert_hf_to_gguf.py --outtype f16 \
+            --outfile "out-${{ matrix.model }}-f16.gguf" "models/${{ matrix.dir }}"
+
+      - name: Hard assert - output must equal the machine-independent hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v sha256sum >/dev/null 2>&1; then SHA="sha256sum"; else SHA="shasum -a 256"; fi
+          $SHA "out-${{ matrix.model }}-f16.gguf"
+          echo "${{ matrix.expected_sha256 }}  out-${{ matrix.model }}-f16.gguf" | $SHA -c -
+          echo "OK: ${{ matrix.os }} reproduced ${{ matrix.model }} F16 bit-exactly"
+
+  # Shard-topology invariance: split the single-file snapshot into small
+  # shards (contiguous tensor order) + index.json, then convert. The output
+  # must equal the SAME expected hash as the unsharded leg. Note the scope:
+  # shards must preserve canonical tensor order — the converter emits tensors
+  # in input iteration order, so a permuted weight_map permutes the output
+  # (content unchanged, order changed). Order is part of the recipe.
+  convert-resharded:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+        model: [qwen2.5-0.5b-instruct, granite-3.0-1b-a400m-instruct]
+        include:
+          - model: qwen2.5-0.5b-instruct
+            repo: Qwen/Qwen2.5-0.5B-Instruct
+            revision: 7ae557604adf67be50417f59c2c2f167def9a775
+            dir: Qwen2.5-0.5B-Instruct
+            digests: conversion/qwen2.5-0.5b-instruct-input-digests.txt
+            shard_bytes: 209715200
+            expected_sha256: 977753a3fb91f43c146b3437b90e09a99ffaef95e0b62ce02869ddc792d3c421
+          - model: granite-3.0-1b-a400m-instruct
+            repo: ibm-granite/granite-3.0-1b-a400m-instruct
+            revision: ffec3c35bdfd97a06f0b4cd5fcc92cd9b1584445
+            dir: granite-3.0-1b-a400m-instruct
+            digests: conversion/granite-3.0-1b-a400m-instruct-input-digests.txt
+            shard_bytes: 524288000
+            expected_sha256: 9a8b6fcdee0e3b5cbd93e0813faabc93755173643070ad5794fa41c8c970c6d0
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout evidence repo (input digests + reshard tool)
+        uses: actions/checkout@v4
+
+      - name: Clone llama.cpp at pinned master commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir llama.cpp && cd llama.cpp
+          git init -q
+          git remote add origin https://github.com/ggml-org/llama.cpp
+          git fetch -q --depth 1 origin "$LLAMA_MASTER_SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install converter dependencies (llama.cpp's own pins)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet -r llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+
+      - name: Download the safetensors snapshot at the pinned revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          from huggingface_hub import snapshot_download
+          snapshot_download("${{ matrix.repo }}",
+              revision="${{ matrix.revision }}",
+              local_dir="models/${{ matrix.dir }}",
+              allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja", "*.model"])
+          EOF
+
+      - name: Verify the input closure (exact file set + sha256 of every file)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "models/${{ matrix.dir }}"
+          rm -rf .cache
+          find . -type f | sed 's|^\./||' | sort > /tmp/actual-files.txt
+          awk '{print $2}' "$GITHUB_WORKSPACE/${{ matrix.digests }}" | sort > /tmp/expected-files.txt
+          diff -u /tmp/expected-files.txt /tmp/actual-files.txt
+          if command -v sha256sum >/dev/null 2>&1; then SHA="sha256sum"; else SHA="shasum -a 256"; fi
+          $SHA -c "$GITHUB_WORKSPACE/${{ matrix.digests }}"
+
+      - name: Reshard (contiguous tensor order preserved)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 conversion/reshard.py "models/${{ matrix.dir }}" \
+            "resharded/${{ matrix.dir }}" --max-shard-bytes "${{ matrix.shard_bytes }}"
+          ls "resharded/${{ matrix.dir }}"
+
+      - name: Convert the resharded snapshot to F16 GGUF
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 llama.cpp/convert_hf_to_gguf.py --outtype f16 \
+            --outfile "out-${{ matrix.model }}-f16.gguf" "resharded/${{ matrix.dir }}"
+
+      - name: Hard assert - resharded input must reproduce the unsharded hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v sha256sum >/dev/null 2>&1; then SHA="sha256sum"; else SHA="shasum -a 256"; fi
+          $SHA "out-${{ matrix.model }}-f16.gguf"
+          echo "${{ matrix.expected_sha256 }}  out-${{ matrix.model }}-f16.gguf" | $SHA -c -
+          echo "OK: ${{ matrix.os }} resharded ${{ matrix.model }} reproduced the unsharded F16 bit-exactly"
+
+  verdict:
+    needs: [convert, convert-resharded]
+    runs-on: ubuntu-latest
+    steps:
+      - name: State the proven claim
+        shell: bash
+        run: |
+          echo "convert_hf_to_gguf.py at the pinned llama.cpp master commit is"
+          echo "bit-reproducible: ubuntu-x86_64 and macos-14-arm64 both reproduced,"
+          echo "for four models (two dense families, a GraniteMoe MoE, and a"
+          echo "per-expert-tensor Mixtral), the exact F16 sha256s produced on an"
+          echo "independent arm64 machine - and resharded snapshots reproduce the"
+          echo "same hashes. The safetensors -> F16 edge of the derivation chain"
+          echo "is deterministic under pinned inputs."
+

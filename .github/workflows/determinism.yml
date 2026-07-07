@@ -5,6 +5,8 @@ on:
     paths-ignore:
       - "README.md"
       - "LICENSE"
+      - ".github/workflows/conversion.yml"
+      - "conversion/**"
   workflow_dispatch:
 
 env:
