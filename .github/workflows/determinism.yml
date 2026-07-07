@@ -71,8 +71,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work
-          curl -sL --retry 3 --retry-delay 5 -o work/model-f16.gguf "${{ matrix.model_url }}"
-          curl -sL --retry 3 --retry-delay 5 -o work/imatrix.dat "${{ matrix.imatrix_url }}"
+          curl -sL --retry 5 --retry-delay 10 --retry-all-errors -o work/model-f16.gguf "${{ matrix.model_url }}"
+          curl -sL --retry 5 --retry-delay 10 --retry-all-errors -o work/imatrix.dat "${{ matrix.imatrix_url }}"
           if command -v sha256sum >/dev/null 2>&1; then SHA="sha256sum"; else SHA="shasum -a 256"; fi
           echo "${{ matrix.model_sha256 }}  work/model-f16.gguf" | $SHA -c -
           echo "${{ matrix.imatrix_sha256 }}  work/imatrix.dat" | $SHA -c -
@@ -169,7 +169,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work
-          curl -sL --retry 3 --retry-delay 5 -o work/model-f16.gguf \
+          curl -sL --retry 5 --retry-delay 10 --retry-all-errors -o work/model-f16.gguf \
             "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-f16.gguf"
           if command -v sha256sum >/dev/null 2>&1; then SHA="sha256sum"; else SHA="shasum -a 256"; fi
           echo "1f33ad43d2b85b908ff06fe7002b69806a57359b9b2617ca27d7bdea428ae146  work/model-f16.gguf" | $SHA -c -
@@ -245,7 +245,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work
-          curl -sL --retry 3 --retry-delay 5 -o work/model-f16.gguf \
+          curl -sL --retry 5 --retry-delay 10 --retry-all-errors -o work/model-f16.gguf \
             "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-f16.gguf"
           echo "1f33ad43d2b85b908ff06fe7002b69806a57359b9b2617ca27d7bdea428ae146  work/model-f16.gguf" | sha256sum -c -
 
@@ -331,7 +331,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work
-          curl -sL --retry 3 --retry-delay 5 -o work/Llama-3.2-1B-Instruct-f16.gguf \
+          curl -sL --retry 5 --retry-delay 10 --retry-all-errors -o work/Llama-3.2-1B-Instruct-f16.gguf \
             "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-f16.gguf"
           echo "1f33ad43d2b85b908ff06fe7002b69806a57359b9b2617ca27d7bdea428ae146  work/Llama-3.2-1B-Instruct-f16.gguf" | sha256sum -c -
 
