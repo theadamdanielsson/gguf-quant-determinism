@@ -1,11 +1,13 @@
 # gguf-quant-determinism
 
 [![determinism](https://github.com/theadamdanielsson/gguf-quant-determinism/actions/workflows/determinism.yml/badge.svg)](https://github.com/theadamdanielsson/gguf-quant-determinism/actions/workflows/determinism.yml)
+[![conversion](https://github.com/theadamdanielsson/gguf-quant-determinism/actions/workflows/conversion.yml/badge.svg)](https://github.com/theadamdanielsson/gguf-quant-determinism/actions/workflows/conversion.yml)
 
-Re-runnable CI evidence for two claims about llama.cpp GGUF quantization:
+Re-runnable CI evidence for three claims about how GGUF files get made:
 
 1. **Default builds are not bit-reproducible across machines.** The same F16, the same quant type (and, where used, the same imatrix) produce different bytes on x86_64/gcc (ubuntu-latest) vs arm64/clang (macos-14). The cause is FP contraction (FMA) in the quant scale-search loops: near-tie scale comparisons flip when the compiler fuses a multiply-add.
 2. **Disabling FP contraction fixes it** — and the exact fix proposed upstream in [ggml-org/llama.cpp#25353](https://github.com/ggml-org/llama.cpp/pull/25353) (a per-file `-ffp-contract=off` on `ggml/src/ggml-quants.c`, nothing else) is itself tested here, applied to a pinned llama.cpp master and asserted bit-identical across both platforms.
+3. **The conversion step (safetensors → F16) is already bit-reproducible.** `convert_hf_to_gguf.py` at the same pinned master produces byte-identical F16 files across OSes, architectures, and dependency versions — provided the inputs are pinned. Together with 2, the whole safetensors → F16 → quant chain is deterministic.
 
 ## The matrix
 
@@ -46,15 +48,38 @@ Reading: quantization itself costs ~0.46 PPL over F16. The contraction flag chan
 
 Why this is expected: contraction only flips near-tie scale candidates in the k-quant search. When two candidate scales are within rounding of each other, either one encodes the block's weights equally well, so choosing between them deterministically does not cost accuracy.
 
+## The conversion leg (safetensors → F16)
+
+[conversion.yml](.github/workflows/conversion.yml) converts revision-pinned Hugging Face snapshots with the converter's own pinned requirements and asserts one sha256 per model — the hash produced on an independent arm64 machine outside CI. ubuntu-latest (x86_64) and macos-14 (arm64) must both reproduce it, byte for byte.
+
+| Model | Why it's in the matrix |
+|-------|------------------------|
+| SmolLM2-135M-Instruct | dense, BF16, fast smoke model |
+| Qwen2.5-0.5B-Instruct | dense, BF16, second family |
+| granite-3.0-1b-a400m-instruct | MoE (GraniteMoe), experts stored pre-stacked |
+| Mixtral-tiny | MoE with per-expert checkpoint tensors — exercises the expert-stacking path |
+
+A second job (`convert-resharded`) splits each single-file snapshot into small shards plus an index.json, converts that, and asserts the **same** hash as the unsharded leg: shard topology does not reach the output.
+
+Every input is closed over — the exact file set and the sha256 of every snapshot file are asserted before converting (digest files in [conversion/](conversion/)). That closure is load-bearing; three things change the output if you let them drift:
+
+- **The source directory name.** `general.name`, `general.basename`, `general.finetune` and `general.size_label` are derived from it by gguf-py heuristics, and `--model-name` overrides only the first. Convert from a directory named exactly like the source repo.
+- **README.md.** If a model card is present the converter reads it, and its fields become KVs (license, languages, organization). It is part of the input; pin it or exclude it consistently.
+- **Tensor order.** The converter writes tensors in input iteration order. Order-preserving shards reproduce the file exactly; a permuted weight_map permutes the output while every tensor's bytes stay identical (measured: 0 of 290 content hashes changed). Publisher shards are contiguous in practice, but strictly the index is part of the recipe.
+
+Probed locally beyond the CI matrix, all bit-identical: repeated runs, PYTHONHASHSEED, numpy 1.26.4 → 2.5.1, torch 2.11.0 → 2.12.1, Python 3.12 → 3.13, and an F32-weight model where the F16 cast genuinely rounds. One more datum: bartowski's published SmolLM2-135M F16, converted on different hardware with a roughly two-years-older stack, has bit-identical tensor payloads to the pinned conversion here — the diff is header metadata only.
+
+Why this is expected: BF16 → F16 is exact for every in-range value (a 7-bit mantissa fits in a 10-bit one), and the converter does no reductions and no threading, so the numeric surface where machines could disagree is nearly empty. It still had to be measured. Measured scope: dense and MoE text models, single- and multi-shard, F16 output. Not measured: mmproj/vision paths, converter-side quantized outtypes (q8_0 etc.), big-endian.
+
 ## How to re-run
 
 Everything is public and pinned; no secrets, no local state:
 
 1. Fork this repo.
-2. Actions tab → `determinism` → Run workflow (or push any commit touching the workflow).
+2. Actions tab → `determinism` or `conversion` → Run workflow (or push any commit touching the workflow).
 3. Read the `verdict` job output.
 
-The workflow is [.github/workflows/determinism.yml](.github/workflows/determinism.yml); the upstream patch under test is in [patches/](patches/).
+The workflows are [.github/workflows/determinism.yml](.github/workflows/determinism.yml) and [.github/workflows/conversion.yml](.github/workflows/conversion.yml); the upstream patch under test is in [patches/](patches/).
 
 ## License
 
